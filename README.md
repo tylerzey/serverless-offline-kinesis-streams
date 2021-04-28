@@ -10,9 +10,7 @@ It works with:
 - `serverless-typescript`
 - `serverless-parcel`
 
-Serverless Offline Kinesis Streams also works with multiple Kinesis streams in the same Serverless file.
-
-It will create one stream for every stream you add to your streams array in the configuration file. This will then trigger each function that listens to that stream
+Serverless Offline Kinesis Streams also works with multiple Kinesis streams in the same Serverless file. It respects batchWindow and batchSize. You can even listen to the same Kinesis Stream with multiple Lambda functions at once with different batchWindow and batchSize values.
 
 ## Installation
 
@@ -34,14 +32,14 @@ plugins:
 
 ## Configuration
 
-Example with one stream:
+Simple setup
 
 ```yaml
 custom:
   offlineKinesisStreams:
     port: 4567 # Optional; 4567 is the default port. The plugin launches a local Kinesis instance on this port
     region: local # Optional; local is the default
-    streams:
+    streams: # Required; Define all streams and their streamNames with number of shards.
       - streamName: myFirstKinesisStream
         shards: 1
 
@@ -52,7 +50,7 @@ functions:
       - stream:
           enabled: true
           type: kinesis
-          arn: arn:aws:kinesis:${self:custom.region}:*:stream/myFirstKinesisStream
+          arn: arn:aws:kinesis:${self:custom.region}:*:stream/myFirstKinesisStream # Same stream name from above.
 ```
 
 Example with multiple stream:
@@ -60,8 +58,8 @@ Example with multiple stream:
 ```yaml
 custom:
   offlineKinesisStreams:
-    port: 4567 # Optional; 4567 is the default port. The plugin launches a local Kinesis instance on this port
-    region: local # Optional; local is the default
+    port: 4567
+    region: local
     streams:
       - streamName: myFirstKinesisStream
         shards: 1
@@ -83,6 +81,40 @@ functions:
           enabled: true
           type: kinesis
           arn: arn:aws:kinesis:${self:custom.region}:*:stream/mySecondKinesisStream
+```
+
+Example with batchWindow and batchSize:
+
+The example below will trigger both Lambda functions when the single Kinesis Stream has records. They are independently monitored and their batchWindow & batchSize events are individual respected.
+
+So, when records are put into the Kinesis stream, the `myFirstKinesisStreamHandler` will most likely pick them up first (10 records at a time). And then, every 60 seconds, `alsoListensToFirstStream` will grab 1 record. (This example is contrived. You'd never want such a high batchWindow and low batchSize.)
+
+```yaml
+custom:
+  offlineKinesisStreams:
+    port: 4567
+    region: local
+    streams:
+      - streamName: myFirstKinesisStream
+        shards: 1
+
+functions:
+  myFirstKinesisStreamHandler:
+    handler: src/myFirstKinesisStreamHandler.handler
+    events:
+      - stream:
+          enabled: true
+          type: kinesis
+          arn: arn:aws:kinesis:${self:custom.region}:*:stream/myFirstKinesisStream
+  alsoListensToFirstStream:
+    handler: src/mySecondKinesisStreamHandler.handler
+    events:
+      - stream:
+          enabled: true
+          type: kinesis
+          batchWindow: 60 # Get records every 60 seconds
+          batchSize: 1 # Get one record at a time
+          arn: arn:aws:kinesis:${self:custom.region}:*:stream/myFirstKinesisStream
 ```
 
 ## Thanks

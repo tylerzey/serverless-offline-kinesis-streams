@@ -1,6 +1,6 @@
 import * as path from "path";
 import { Kinesis } from "aws-sdk";
-import { ShardIterator } from "aws-sdk/clients/kinesis";
+import { ShardIterator, ShardIteratorType } from "aws-sdk/clients/kinesis";
 // @ts-expect-error
 import Kinesalite from "kinesalite";
 
@@ -14,7 +14,11 @@ interface StreamType {
 
 type ServerlessEventType = {
   arn?: string;
+  enabled?: boolean;
   type?: "kinesis" | "dynamodb";
+  batchSize?: number;
+  batchWindow?: number;
+  startingPosition?: ShardIteratorType;
 };
 type ServerlessEventObjectType = {
   stream?: ServerlessEventType;
@@ -80,62 +84,85 @@ class ServerlessLocalKinesis {
     };
   }
 
-  public pollKinesis = (functions: string[]) => (
-    firstShardIterator: ShardIterator
-  ) => {
-    const mapKinesisRecord = (record: any) => ({
-      approximateArrivalTimestamp: record.ApproximateArrivalTimestamp,
-      data: record.Data.toString("base64"),
-      partitionKey: record.PartitionKey,
-      sequenceNumber: record.SequenceNumber,
-    });
+  public initializePollKinesis = async (streamInformation: {
+    batchSize: number;
+    batchWindow: number;
+    startingPosition: string;
+    handler: string;
+    streamName: string;
+  }): Promise<void> => {
+    const handler = streamInformation.handler;
+    const stream = await this.kinesis
+      .describeStream({ StreamName: streamInformation.streamName })
+      .promise();
 
-    const reduceRecord = (handlers: string[]) => (
-      promise: any,
-      kinesisRecord: any
-    ) =>
-      promise.then(() => {
-        const singleRecordEvent = {
-          Records: [{ kinesis: mapKinesisRecord(kinesisRecord) }],
-        };
+    const { ShardId } = stream.StreamDescription.Shards[0];
 
-        handlers.forEach(async (handler: string) => {
-          this.serverlessLog(`🤗 Invoking lambda '${handler}'`);
-
-          const moduleFileName = `${handler.split(".")[0]}.js`;
-
-          const handlerFilePath = path.join(
-            this.serverless.config.servicePath,
-            moduleFileName
-          );
-          delete require.cache[require.resolve(handlerFilePath)]
-          const module = require(handlerFilePath);
-
-          const functionObjectPath = handler.split(".").slice(1);
-
-          let mod = module;
-
-          for (const p of functionObjectPath) {
-            mod = mod[p];
-          }
-
-          return mod(singleRecordEvent);
-        });
-      });
-
-    const fetchAndProcessRecords = async (shardIterator: ShardIterator) => {
-      const records = await this.kinesis
-        .getRecords({ ShardIterator: shardIterator })
-        .promise();
-
-      await records.Records.reduce(reduceRecord(functions), Promise.resolve());
-
-      setTimeout(async () => {
-        await fetchAndProcessRecords(records.NextShardIterator!);
-      }, 1000);
+    const params = {
+      StreamName: streamInformation.streamName,
+      ShardId,
+      ShardIteratorType: streamInformation.startingPosition,
     };
 
-    return fetchAndProcessRecords(firstShardIterator);
+    const shardIterator = await this.kinesis.getShardIterator(params).promise();
+
+    const dispatchRecordsToLambdaFunction = async (
+      records: Kinesis.RecordList
+    ) => {
+      this.serverlessLog(`🤗 Invoking lambda '${handler}'`);
+
+      const moduleFileName = `${handler.split(".")[0]}.js`;
+
+      const handlerFilePath = path.join(
+        this.serverless.config.servicePath,
+        moduleFileName
+      );
+      delete require.cache[require.resolve(handlerFilePath)];
+      const module = require(handlerFilePath);
+
+      const functionObjectPath = handler.split(".").slice(1);
+
+      let mod = module;
+
+      for (const p of functionObjectPath) {
+        mod = mod[p];
+      }
+
+      const mapKinesisRecord = (record: Kinesis.Record) => ({
+        approximateArrivalTimestamp: record.ApproximateArrivalTimestamp,
+        data: record.Data.toString("base64"),
+        partitionKey: record.PartitionKey,
+        sequenceNumber: record.SequenceNumber,
+      });
+
+      return mod({
+        Records: records.map((item) => ({
+          kinesis: { ...mapKinesisRecord(item) },
+        })),
+      });
+    };
+
+    const fetchAndProcessRecords = async (
+      shardIterator: ShardIterator
+    ): Promise<void> => {
+      const response = await this.kinesis
+        .getRecords({
+          ShardIterator: shardIterator,
+          Limit: streamInformation.batchSize,
+        })
+        .promise();
+      const records = response.Records || [];
+
+      if (records.length > 0) {
+        await dispatchRecordsToLambdaFunction(records);
+      }
+
+      setTimeout(async () => {
+        await fetchAndProcessRecords(response.NextShardIterator!);
+      }, streamInformation.batchWindow || 1000);
+    };
+
+    return fetchAndProcessRecords(shardIterator.ShardIterator!);
   };
 
   private async run() {
@@ -148,19 +175,65 @@ class ServerlessLocalKinesis {
         );
       }
 
-      this.pluginOptionsWithDefaults.streams.forEach(
-        async ({ streamName, shards }) => {
-          if (!streamName) {
-            throw new Error(
-              `${pluginName} - Please define a stream name for every stream in your array.`
+      for (const { streamName, shards } of this.pluginOptionsWithDefaults
+        .streams) {
+        if (!streamName) {
+          throw new Error(
+            `${pluginName} - Please define a stream name for every stream in your array.`
+          );
+        }
+
+        await this.createStream(streamName, shards);
+      }
+
+      const slsFunctions: ServerlessFunctionType = this.serverless.service
+        .functions;
+
+      const listOfKinesisStreamEvents = Object.entries(slsFunctions).flatMap(
+        ([fnName, serverlessFunction]) => {
+          const handler = serverlessFunction.handler || "";
+          return (serverlessFunction.events || [])
+            .filter(
+              (serverlessEvent) =>
+                handler &&
+                serverlessEvent?.stream?.type === "kinesis" &&
+                serverlessEvent?.stream?.arn?.includes("kinesis")
+            )
+            .filter((serverlessEvent) => {
+              if (!serverlessEvent?.stream?.enabled) {
+                this.serverlessLog(
+                  `${fnName} - is being ignored from Kinesis stream due to it's 'enabled' flag being falsy`
+                );
+                return false;
+              }
+              return true;
+            })
+            .map(
+              ({
+                stream: {
+                  arn,
+                  batchSize = 10,
+                  batchWindow = 1,
+                  startingPosition = "LATEST",
+                } = {},
+              }) => {
+                const streamName = arn?.substring(arn.indexOf("/") + 1) || "";
+
+                return {
+                  batchSize,
+                  startingPosition,
+                  handler,
+                  streamName,
+                  batchWindow: batchWindow * 1000,
+                };
+              }
             );
-          }
-
-          await this.createStream(streamName, shards);
-
-          await this.watchEvents(streamName);
         }
       );
+
+      for (const streamInformation of listOfKinesisStreamEvents) {
+        this.initializePollKinesis(streamInformation);
+      }
     } catch (e) {
       this.serverlessLog(e);
     }
@@ -205,53 +278,6 @@ class ServerlessLocalKinesis {
         reject(e);
       }
     });
-  }
-
-  private async watchEvents(streamName: string): Promise<void> {
-    const stream = await this.kinesis
-      .describeStream({ StreamName: streamName })
-      .promise();
-
-    const { ShardId } = stream.StreamDescription.Shards[0];
-
-    const params = {
-      StreamName: streamName,
-      ShardId,
-      ShardIteratorType: "LATEST",
-    };
-
-    const shardIterator = await this.kinesis.getShardIterator(params).promise();
-
-    const functions = [];
-    const slsFunctions: ServerlessFunctionType = this.serverless.service
-      .functions;
-
-    for (const [, serverlessFunction] of Object.entries(slsFunctions)) {
-      if (!serverlessFunction.handler) {
-        this.serverlessLog(
-          "Not adding listener for " +
-            serverlessFunction.name +
-            " because it does not have a handler"
-        );
-        continue;
-      }
-
-      const isStreamEventForThisStream = (serverlessFunction.events || []).some(
-        (serverlessEvent) => {
-          return (
-            serverlessEvent?.stream?.type === "kinesis" &&
-            serverlessEvent?.stream?.arn?.includes("kinesis") &&
-            serverlessEvent?.stream?.arn?.includes(streamName)
-          );
-        }
-      );
-
-      if (isStreamEventForThisStream) {
-        functions.push(serverlessFunction.handler);
-      }
-    }
-
-    this.pollKinesis(functions)(shardIterator.ShardIterator!);
   }
 }
 
