@@ -7,7 +7,7 @@ export const dispatchRecordsToLambdaFunction = async (
   handler: string,
   servicePath: string
 ) => {
-  logger(`🤗 Invoking lambda '${handler}'`);
+  logger(`🤗 Invoking lambda ${handler}`);
 
   const moduleFileName = `${handler.split(".")[0]}.js`;
 
