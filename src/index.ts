@@ -108,7 +108,7 @@ class ServerlessLocalKinesis {
             this.serverless.config.servicePath,
             moduleFileName
           );
-
+          delete require.cache[require.resolve(handlerFilePath)]
           const module = require(handlerFilePath);
 
           const functionObjectPath = handler.split(".").slice(1);
