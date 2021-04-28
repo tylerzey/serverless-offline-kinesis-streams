@@ -1,37 +1,12 @@
-import * as path from "path";
 import { Kinesis } from "aws-sdk";
-import { ShardIterator, ShardIteratorType } from "aws-sdk/clients/kinesis";
+import { ShardIterator } from "aws-sdk/clients/kinesis";
 // @ts-expect-error
 import Kinesalite from "kinesalite";
+import { dispatchRecordsToLambdaFunction } from "./lib/dispatchRecordsToLambda";
+import { StreamType, ServerlessFunctionType } from "./lib/types";
 
 const pluginName = "serverless-offline-kinesis-streams";
 const pluginCustomKeyName = "offlineKinesisStreams";
-
-interface StreamType {
-  streamName: string;
-  shards: number;
-}
-
-type ServerlessEventType = {
-  arn?: string;
-  enabled?: boolean;
-  type?: "kinesis" | "dynamodb";
-  batchSize?: number;
-  batchWindow?: number;
-  startingPosition?: ShardIteratorType;
-};
-type ServerlessEventObjectType = {
-  stream?: ServerlessEventType;
-  http?: ServerlessEventType;
-};
-
-type FunctionName = string;
-type FunctionDefinitionHandler = {
-  handler?: string;
-  name: string;
-  events?: ServerlessEventObjectType[];
-};
-type ServerlessFunctionType = Record<FunctionName, FunctionDefinitionHandler>;
 
 class ServerlessLocalKinesis {
   private serverless: any;
@@ -61,16 +36,17 @@ class ServerlessLocalKinesis {
       );
     }
 
+    const pluginOptions = {
+      ...this.serverless.service.custom[pluginCustomKeyName],
+    };
+
     this.pluginOptionsWithDefaults = {
-      port: this.serverless.service.custom[pluginCustomKeyName].port || 4567,
-      region:
-        this.serverless.service.custom[pluginCustomKeyName].region || "local",
-      streams: this.serverless.service.custom[pluginCustomKeyName].streams.map(
-        (streamData: StreamType) => ({
-          streamName: streamData.streamName,
-          shards: streamData.shards || 1,
-        })
-      ),
+      port: pluginOptions.port || 4567,
+      region: pluginOptions.region || "local",
+      streams: pluginOptions.streams.map((streamData: StreamType) => ({
+        streamName: streamData.streamName,
+        shards: streamData.shards || 1,
+      })),
     };
 
     this.kinesis = new Kinesis({
@@ -106,42 +82,6 @@ class ServerlessLocalKinesis {
 
     const shardIterator = await this.kinesis.getShardIterator(params).promise();
 
-    const dispatchRecordsToLambdaFunction = async (
-      records: Kinesis.RecordList
-    ) => {
-      this.serverlessLog(`🤗 Invoking lambda '${handler}'`);
-
-      const moduleFileName = `${handler.split(".")[0]}.js`;
-
-      const handlerFilePath = path.join(
-        this.serverless.config.servicePath,
-        moduleFileName
-      );
-      delete require.cache[require.resolve(handlerFilePath)];
-      const module = require(handlerFilePath);
-
-      const functionObjectPath = handler.split(".").slice(1);
-
-      let mod = module;
-
-      for (const p of functionObjectPath) {
-        mod = mod[p];
-      }
-
-      const mapKinesisRecord = (record: Kinesis.Record) => ({
-        approximateArrivalTimestamp: record.ApproximateArrivalTimestamp,
-        data: record.Data.toString("base64"),
-        partitionKey: record.PartitionKey,
-        sequenceNumber: record.SequenceNumber,
-      });
-
-      return mod({
-        Records: records.map((item) => ({
-          kinesis: { ...mapKinesisRecord(item) },
-        })),
-      });
-    };
-
     const fetchAndProcessRecords = async (
       shardIterator: ShardIterator
     ): Promise<void> => {
@@ -154,11 +94,16 @@ class ServerlessLocalKinesis {
       const records = response.Records || [];
 
       if (records.length > 0) {
-        await dispatchRecordsToLambdaFunction(records);
+        await dispatchRecordsToLambdaFunction(
+          records,
+          this.serverlessLog,
+          handler,
+          this.serverless.config.servicePath
+        );
       }
 
-      setTimeout(async () => {
-        await fetchAndProcessRecords(response.NextShardIterator!);
+      setTimeout(() => {
+        fetchAndProcessRecords(response.NextShardIterator!);
       }, streamInformation.batchWindow || 1000);
     };
 
@@ -167,16 +112,17 @@ class ServerlessLocalKinesis {
 
   private async run() {
     try {
-      await this.createKinesis(this.pluginOptionsWithDefaults.port);
+      const streams = this.pluginOptionsWithDefaults.streams;
 
-      if (this.pluginOptionsWithDefaults.streams.length === 0) {
+      if (streams.length === 0) {
         throw new Error(
           `${pluginName} - Please define at least one stream on the ${pluginCustomKeyName} property`
         );
       }
 
-      for (const { streamName, shards } of this.pluginOptionsWithDefaults
-        .streams) {
+      await this.createKinesis(this.pluginOptionsWithDefaults.port);
+
+      for (const { streamName, shards } of streams) {
         if (!streamName) {
           throw new Error(
             `${pluginName} - Please define a stream name for every stream in your array.`
@@ -192,6 +138,7 @@ class ServerlessLocalKinesis {
       const listOfKinesisStreamEvents = Object.entries(slsFunctions).flatMap(
         ([fnName, serverlessFunction]) => {
           const handler = serverlessFunction.handler || "";
+
           return (serverlessFunction.events || [])
             .filter(
               (serverlessEvent) =>
