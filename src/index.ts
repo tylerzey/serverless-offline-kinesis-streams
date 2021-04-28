@@ -2,6 +2,7 @@ import { Kinesis } from "aws-sdk";
 import { ShardIterator } from "aws-sdk/clients/kinesis";
 // @ts-expect-error
 import Kinesalite from "kinesalite";
+import { buildListOfStreamEvents } from "./lib/buildListOfStreamEvents";
 import { dispatchRecordsToLambdaFunction } from "./lib/dispatchRecordsToLambda";
 import { StreamType, ServerlessFunctionType } from "./lib/types";
 
@@ -135,47 +136,9 @@ class ServerlessLocalKinesis {
       const slsFunctions: ServerlessFunctionType = this.serverless.service
         .functions;
 
-      const listOfKinesisStreamEvents = Object.entries(slsFunctions).flatMap(
-        ([fnName, serverlessFunction]) => {
-          const handler = serverlessFunction.handler || "";
-
-          return (serverlessFunction.events || [])
-            .filter(
-              (serverlessEvent) =>
-                handler &&
-                serverlessEvent?.stream?.type === "kinesis" &&
-                serverlessEvent?.stream?.arn?.includes("kinesis")
-            )
-            .filter((serverlessEvent) => {
-              if (!serverlessEvent?.stream?.enabled) {
-                this.serverlessLog(
-                  `${fnName} - is being ignored from Kinesis stream due to it's 'enabled' flag being falsy`
-                );
-                return false;
-              }
-              return true;
-            })
-            .map(
-              ({
-                stream: {
-                  arn,
-                  batchSize = 10,
-                  batchWindow = 1,
-                  startingPosition = "LATEST",
-                } = {},
-              }) => {
-                const streamName = arn?.substring(arn.indexOf("/") + 1) || "";
-
-                return {
-                  batchSize,
-                  startingPosition,
-                  handler,
-                  streamName,
-                  batchWindow: batchWindow * 1000,
-                };
-              }
-            );
-        }
+      const listOfKinesisStreamEvents = buildListOfStreamEvents(
+        slsFunctions,
+        this.serverlessLog
       );
 
       for (const streamInformation of listOfKinesisStreamEvents) {
